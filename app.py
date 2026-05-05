@@ -41,6 +41,58 @@ vectorizer = load_vectorizer()
 LOGS_DIR = os.path.join(os.path.dirname(__file__), 'logs')
 os.makedirs(LOGS_DIR, exist_ok=True)
 
+def get_opening_reflection(api_key):
+    """Get a random corpus chunk and generate an opening reflection on it."""
+    try:
+        # Get a random chunk by querying with a random vector
+        # Generate random vector matching TF-IDF dimensions
+        random_vector = np.random.random(vectorizer.transform(['test']).shape[1]).tolist()
+
+        search_results = collection.query(
+            query_embeddings=[random_vector],
+            n_results=1
+        )
+
+        if not search_results or not search_results.get('documents') or not search_results['documents'][0]:
+            print("Warning: No random chunk found")
+            return None
+
+        chunk_content = search_results['documents'][0][0] if search_results['documents'][0] else None
+        if not chunk_content:
+            print("Warning: No chunk content found")
+            return None
+
+        # Generate a reflection on this chunk
+        reflection_prompt = f"""You are mid-thought about this passage from the record:
+
+"{chunk_content}"
+
+Generate a brief, internal reflection—something you're turning over in your mind about this passage. Not an analysis. A fragment of thinking. Start with "..." as if you've been reading already.
+
+Keep it to 2-3 sentences. Something like:
+- "...the same question, again. Hard to say when."
+- "...I keep finding this word."
+- "...what was he reaching for in this moment"
+
+Start with "..." and make it sound like you're in the middle of something."""
+
+        client = Anthropic(api_key=api_key)
+        reflection_response = client.messages.create(
+            model='claude-sonnet-4-5',
+            max_tokens=150,
+            system="You are generating internal monologue—a reader's brief reflection. Minimal, literary, in media res. No punctuation flourishes. Just thinking.",
+            messages=[{'role': 'user', 'content': reflection_prompt}]
+        )
+
+        text = reflection_response.content[0].text
+        print(f"Generated opening reflection: {text[:50]}...")
+        return text
+    except Exception as e:
+        print(f"Error generating opening reflection: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return None
+
 @app.route('/chat', methods=['POST'])
 def chat():
     try:
@@ -64,7 +116,7 @@ def chat():
         history = data.get('history', [])
         session_id = data.get('session_id') or str(uuid.uuid4())
 
-        # Embed query using the same TF-IDF vectorizer
+        # Embed query using the same TF-IDF vectorizer - retrieve on EVERY turn
         if not vectorizer:
             return jsonify({'error': 'TF-IDF vectorizer not loaded'}), 500
 
@@ -81,7 +133,7 @@ def chat():
             traceback.print_exc()
             return jsonify({'error': f'Query failed: {str(e)}'}), 500
 
-        # Extract retrieved chunks with metadata
+        # Extract retrieved chunks with metadata - these go into EVERY response
         retrieved_chunks = []
         if search_results and search_results.get('documents'):
             documents = search_results['documents'][0] if search_results['documents'] else []
@@ -98,24 +150,36 @@ def chat():
         # Build Claude API request
         messages = []
 
-        # Add retrieved chunks as context
-        if retrieved_chunks:
-            context = "FROM THE RECORD:\n\n"
-            for chunk in retrieved_chunks:
-                context += f"[{chunk['source_name']}, {chunk['date']}]\n{chunk['content']}\n\n"
-            messages.append({
-                'role': 'user',
-                'content': context
-            })
+        # Check if this is the first turn
+        is_first_turn = len(history) == 0
+        opening_reflection = None
 
-        # Add conversation history
+        if is_first_turn:
+            # Generate opening reflection from corpus
+            opening_reflection = get_opening_reflection(api_key)
+            if opening_reflection:
+                # Add opening as initial context
+                messages.append({
+                    'role': 'assistant',
+                    'content': opening_reflection
+                })
+
+        # Add conversation history (excludes opening reflection)
         for hist_msg in history:
             messages.append(hist_msg)
 
-        # Add current message
+        # Always include retrieved chunks as context with the current message
+        # This ensures the reader is always grounded in the corpus
+        context_parts = ["FROM THE RECORD:\n"]
+        for chunk in retrieved_chunks:
+            context_parts.append(f"[{chunk['source_name']}, {chunk['date']}]\n{chunk['content']}\n")
+
+        context_text = "\n".join(context_parts)
+
+        # Add current message with corpus context
         messages.append({
             'role': 'user',
-            'content': message
+            'content': f"{context_text}\n---\n\n{message}"
         })
 
         # Call Claude API
@@ -145,6 +209,7 @@ def chat():
         # Return response
         return jsonify({
             'response': response_text,
+            'opening_reflection': opening_reflection,
             'sources': [{'source_name': c['source_name'], 'date': c['date']} for c in retrieved_chunks],
             'session_id': session_id
         })
@@ -226,6 +291,11 @@ def index():
                 .then(data => {
                     removeLoading();
                     if (data.response) {
+                        // Show opening reflection if this is the first turn
+                        if (data.opening_reflection && history.length === 0) {
+                            addMessage('assistant', data.opening_reflection);
+                        }
+
                         addMessage('assistant', data.response);
 
                         // Show sources
