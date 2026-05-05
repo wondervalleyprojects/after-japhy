@@ -1,0 +1,12 @@
+chroma_db/
+chroma_db.backup/
+logs/
+__pycache__/
+.env
+*.pyc
+master_corpus.jsonl
+corpus_clean.jsonl
+corpus_chunked.jsonl
+gmail_personal_sent.jsonl
+gmail_wvp_sent.jsonl
+.DS_Store
