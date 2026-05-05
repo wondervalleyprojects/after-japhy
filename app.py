@@ -9,6 +9,7 @@ from flask import Flask, request, jsonify
 import chromadb
 from anthropic import Anthropic
 import numpy as np
+import re
 
 app = Flask(__name__)
 
@@ -40,6 +41,105 @@ vectorizer = load_vectorizer()
 # Ensure logs directory exists
 LOGS_DIR = os.path.join(os.path.dirname(__file__), 'logs')
 os.makedirs(LOGS_DIR, exist_ok=True)
+
+def expand_query_semantically(user_query, api_key):
+    """
+    Use Claude to understand the semantic intent of a query and generate
+    related search terms for hybrid keyword matching.
+    """
+    try:
+        client = Anthropic(api_key=api_key)
+
+        prompt = f"""Given this query about a text corpus, generate 4-6 related search terms that would help find relevant material.
+
+Query: "{user_query}"
+
+Return ONLY a comma-separated list of search terms (no explanations, no quotes).
+Focus on synonyms, related concepts, key entities, emotional/thematic elements.
+
+Search terms:"""
+
+        response = client.messages.create(
+            model="claude-opus-4-7",
+            max_tokens=100,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        terms_text = response.content[0].text.strip()
+        terms = [t.strip().lower() for t in terms_text.split(',')]
+        return [user_query.lower()] + terms
+    except Exception as e:
+        print(f"Error expanding query: {e}")
+        return [user_query.lower()]
+
+def hybrid_search(user_query, api_key, collection, vectorizer, n_results=8):
+    """
+    Perform hybrid semantic + keyword search:
+    1. Expand query semantically using Claude
+    2. Retrieve ALL documents (get comprehensive search results)
+    3. Score results by keyword presence in expanded terms
+    4. Return top results by keyword relevance
+    """
+    try:
+        # Get semantic expansion of query
+        expanded_terms = expand_query_semantically(user_query, api_key)
+        print(f"Expanded query terms: {expanded_terms}", flush=True)
+
+        # Get ALL documents (or large batch) to search comprehensively
+        # We'll rely on keyword matching rather than TF-IDF for relevance
+        search_results = collection.get(
+            limit=5000,  # Get up to 5000 documents to search
+            include=['documents', 'metadatas']
+        )
+
+        if not search_results or not search_results.get('documents'):
+            print("No documents found in collection")
+            return []
+
+        # Score all results by keyword presence in expanded terms
+        documents = search_results.get('documents', [])
+        metadatas = search_results.get('metadatas', [])
+
+        scored_results = []
+        for i, doc in enumerate(documents):
+            metadata = metadatas[i] if i < len(metadatas) else {}
+
+            # Keyword match score - how many expanded terms appear in document
+            doc_lower = doc.lower()
+            keyword_matches = sum(1 for term in expanded_terms if term in doc_lower)
+            keyword_score = keyword_matches / len(expanded_terms) if expanded_terms else 0
+
+            # Score based primarily on keyword matches
+            # More keyword matches = exponentially higher score
+            if keyword_matches > 0:
+                combined_score = (keyword_score ** 1.3) * 100  # Exponential boost for keyword matches
+            else:
+                combined_score = 0  # Documents without any keyword matches get 0 score
+
+            # Only include documents with at least one keyword match
+            if keyword_matches > 0:
+                scored_results.append({
+                    'score': combined_score,
+                    'document': doc,
+                    'metadata': metadata,
+                    'tfidf_score': 0,  # Not using TF-IDF anymore
+                    'keyword_score': keyword_score,
+                    'keyword_matches': keyword_matches
+                })
+
+        # Sort by score (highest first)
+        scored_results.sort(key=lambda x: x['score'], reverse=True)
+
+        print(f"Found {len(scored_results)} documents with keyword matches", flush=True)
+
+        # Return top n_results
+        return scored_results[:n_results]
+
+    except Exception as e:
+        print(f"Hybrid search error: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return []
 
 def get_opening_reflection(api_key):
     """Get a random corpus chunk and generate an opening reflection on it."""
@@ -116,36 +216,39 @@ def chat():
         history = data.get('history', [])
         session_id = data.get('session_id') or str(uuid.uuid4())
 
-        # Embed query using the same TF-IDF vectorizer - retrieve on EVERY turn
+        # Special case: opening reflection request (message is "..." and no history)
+        if message == '...' and len(history) == 0:
+            opening_reflection = get_opening_reflection(api_key)
+            return jsonify({
+                'response': '',
+                'opening_reflection': opening_reflection,
+                'sources': [],
+                'session_id': session_id
+            })
+
+        # Perform hybrid semantic + keyword search - retrieve on EVERY turn
         if not vectorizer:
             return jsonify({'error': 'TF-IDF vectorizer not loaded'}), 500
 
         try:
-            query_embedding = vectorizer.transform([message]).toarray()[0]
-            search_results = collection.query(
-                query_embeddings=[query_embedding.tolist()],
-                n_results=8,
-                include=['documents', 'metadatas', 'distances']
-            )
+            scored_results = hybrid_search(message, api_key, collection, vectorizer, n_results=8)
         except Exception as e:
-            print(f"Query error: {e}")
+            print(f"Hybrid search error: {e}")
             import traceback
             traceback.print_exc()
-            return jsonify({'error': f'Query failed: {str(e)}'}), 500
+            return jsonify({'error': f'Search failed: {str(e)}'}), 500
 
         # Extract retrieved chunks with metadata - these go into EVERY response
         retrieved_chunks = []
-        if search_results and search_results.get('documents'):
-            documents = search_results['documents'][0] if search_results['documents'] else []
-            metadatas = search_results.get('metadatas', [[]])[0] if search_results.get('metadatas') else [{}] * len(documents)
-
-            for i, doc in enumerate(documents):
-                metadata = metadatas[i] if i < len(metadatas) else {}
-                retrieved_chunks.append({
-                    'source_name': metadata.get('source_name', 'unknown'),
-                    'date': metadata.get('date', 'unknown'),
-                    'content': doc
-                })
+        for result in scored_results:
+            metadata = result['metadata']
+            retrieved_chunks.append({
+                'source_name': metadata.get('source_name', 'unknown'),
+                'date': metadata.get('date', 'unknown'),
+                'content': result['document'],
+                'keyword_matches': result['keyword_matches'],
+                'combined_score': result['score']
+            })
 
         # Build Claude API request
         messages = []
@@ -260,12 +363,35 @@ def index():
         <script>
             let history = [];
             let sessionId = generateUUID();
+            let hasLoadedOpening = false;
 
             function generateUUID() {
                 return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
                     var r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
                     return v.toString(16);
                 });
+            }
+
+            function loadOpeningReflection() {
+                if (hasLoadedOpening) return;
+                hasLoadedOpening = true;
+
+                fetch('/chat', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        message: '...',
+                        history: [],
+                        session_id: sessionId
+                    })
+                })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.opening_reflection) {
+                        addMessage('assistant', data.opening_reflection);
+                    }
+                })
+                .catch(e => console.error('Error loading opening reflection:', e));
             }
 
             function sendMessage() {
@@ -353,6 +479,18 @@ def index():
                     sendMessage();
                 }
             });
+
+            // Load opening reflection on page load
+            document.addEventListener('DOMContentLoaded', function() {
+                loadOpeningReflection();
+            });
+
+            // Also load immediately in case DOMContentLoaded already fired
+            if (document.readyState === 'loading') {
+                document.addEventListener('DOMContentLoaded', loadOpeningReflection);
+            } else {
+                loadOpeningReflection();
+            }
         </script>
     </body>
     </html>

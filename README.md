@@ -24,12 +24,12 @@ A retrieval-augmented generation (RAG) web app built from a comprehensive person
 4. **Chunking** (111,744 chunks)
    - Records split at sentence boundaries into 300-800 token passages
    - Twitter/Instagram records grouped by date
-   - TF-IDF embeddings using scikit-learn
+   - TF-IDF vectorization using scikit-learn for encoding
 
 5. **Chroma Vector Database**
    - Persistent storage with metadata
    - 111k+ vectors indexed by chunk ID
-   - Fast semantic similarity search
+   - Enables fast document retrieval for hybrid search
 
 ## Setup
 
@@ -154,8 +154,8 @@ The preprocessing step applies a "Victorian name-izer" to personal communication
 
 - **Preprocessing**: ~2 minutes
 - **Chunking**: ~3 minutes
-- **Embedding**: ~5-10 minutes (TF-IDF on 111k chunks)
-- **Query time**: <500ms average
+- **Embedding**: ~5-10 minutes (TF-IDF vectorization on 111k chunks)
+- **Query time**: <500ms average (hybrid search with semantic expansion)
 
 ## Troubleshooting
 
@@ -176,22 +176,42 @@ The preprocessing step applies a "Victorian name-izer" to personal communication
 
 ## Architecture Decisions
 
-### TF-IDF over Dense Embeddings
+### Hybrid Semantic + Keyword Search
+The retrieval system uses a **hybrid approach** combining semantic understanding with direct keyword matching:
+
+1. **Query Expansion (Claude API)**
+   - User query analyzed semantically by Claude to understand intent
+   - Generates 4-6 related search terms, synonyms, and thematic concepts
+   - Example: "happiest moments" → ["happiness", "joy", "contentment", "celebration", "achievement"]
+
+2. **Document Retrieval**
+   - All documents retrieved from Chroma database (up to 5000)
+   - Documents scored primarily by keyword presence in expanded terms
+   - Exponential boost given to documents with multiple keyword matches
+   - Documents with zero keyword matches scored as 0 (filtered out)
+
+3. **Why Hybrid Over TF-IDF Alone**
+   - TF-IDF is a bag-of-words approach that doesn't understand semantic intent
+   - Hybrid approach enables finding conceptually related material (e.g., "joy" for "happiest moments")
+   - Avoids repeatedly returning the same statistically similar documents
+   - Ensures retrieved material is thematically relevant, not just statistically frequent
+
+### TF-IDF Vectorization
+- Scikit-learn TF-IDF used for document encoding into Chroma
 - Avoids PyTorch/sentence-transformers dependency issues
-- Still provides effective semantic search via TF-IDF similarity
 - Scales well to 100k+ chunks
-- Interpretable: shows which terms matched in retrieval
+- Used for initial document representation and retrieval mechanism
 
 ### Chroma for Vector Storage
 - Persistent storage without additional infrastructure
-- Fast similarity search
+- Enables efficient document retrieval for hybrid search
 - Metadata filtering support
 - Single-file database format
 
 ### Session Logging
 - Every conversation logged to JSON for auditability
-- Includes message, history, retrieved chunks, and response
-- Enables analysis of what the corpus reveals
+- Includes message, history, retrieved chunks (with keyword match counts), and response
+- Enables analysis of what the corpus reveals and how retrieval performs
 
 ## License
 

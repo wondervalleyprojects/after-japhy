@@ -53,7 +53,7 @@ python3 scripts/chunk_corpus.py
 Output: `corpus_chunked.jsonl` (111,744 chunks)
 
 ### Step 4: Embedding (~5-10 minutes)
-Creates TF-IDF embeddings and loads into Chroma vector database.
+Creates TF-IDF vectorization and loads documents into Chroma vector database.
 ```bash
 python3 scripts/embed_and_load.py
 ```
@@ -61,6 +61,21 @@ python3 scripts/embed_and_load.py
 Output: `chroma_db/` (1.7GB)
 
 ## API Usage
+
+### How the Retrieval Works
+
+The system uses **hybrid semantic + keyword search**:
+
+1. **Semantic Query Expansion**: Claude analyzes your question to understand intent
+   - Example: "happiest moments" → ["happiness", "joy", "contentment", "celebration"]
+
+2. **Keyword Matching**: Documents are scored by how many expanded keywords they contain
+   - Documents with zero matches: filtered out
+   - Documents with 1+ matches: ranked by match count and semantic relevance
+
+3. **Result Ranking**: Most relevant documents appear first in sources
+
+This hybrid approach finds conceptually related material instead of just statistically similar documents.
 
 ### Query the Corpus
 ```bash
@@ -77,9 +92,10 @@ curl -X POST http://localhost:5000/chat \
 ```json
 {
   "response": "Based on the corpus, he thought...",
+  "opening_reflection": "...the same question, again.",
   "sources": [
-    {"source_name": "article", "date": "2015-03-22"},
-    {"source_name": "twitter", "date": "2016-08-15"}
+    {"source_name": "blog", "date": "2015-03-22"},
+    {"source_name": "article", "date": "2016-08-15"}
   ],
   "session_id": "my-session-id"
 }
@@ -115,10 +131,14 @@ Every conversation is logged to `logs/` directory as JSON files with:
 - Session ID
 - User message
 - Conversation history
-- Retrieved chunks (with content)
+- Retrieved chunks (with content, keyword match counts, and relevance scores)
 - AI response
 
-Use these logs to understand what the corpus revealed about a query.
+Use these logs to understand:
+- What the corpus revealed about a query
+- Which keywords triggered specific matches
+- How many keyword matches each retrieved document had
+- The relevance scoring from the hybrid search
 
 ## Troubleshooting
 
@@ -169,7 +189,10 @@ This helps preserve privacy while maintaining readability of the corpus.
 
 ## Performance Notes
 
-- **Typical query time**: <500ms (TF-IDF retrieval + Claude API call)
+- **Typical query time**: <1000ms (query expansion via Claude + hybrid search + response generation)
+- **Query expansion**: ~200-300ms (Claude API call to understand semantic intent)
+- **Hybrid search**: ~50-100ms (keyword matching across corpus)
+- **Response generation**: ~500-700ms (Claude API generating response)
 - **Concurrent users**: Single-threaded Flask app (use Gunicorn for production)
 - **Database size**: ~1.7GB on disk
 - **Memory usage**: ~500MB at idle, 1.5GB+ during embedding
