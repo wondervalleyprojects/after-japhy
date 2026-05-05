@@ -74,63 +74,74 @@ Search terms:"""
 
 def hybrid_search(user_query, api_key, collection, vectorizer, n_results=8):
     """
-    Perform hybrid semantic + keyword search:
-    1. Expand query semantically using Claude
-    2. Retrieve ALL documents (get comprehensive search results)
-    3. Score results by keyword presence in expanded terms
-    4. Return top results by keyword relevance
+    Perform hybrid semantic + keyword search across ENTIRE corpus:
+    1. Expand query semantically using Claude to understand thematic intent
+    2. Use TF-IDF semantic search to retrieve candidates from across corpus
+    3. Score primarily by keyword matches in expanded terms
+    4. Return top results with diverse sources
+
+    Key insight: Keyword boosting on semantically-retrieved documents ensures
+    we pull from the whole corpus (TF-IDF retrieves from all sources),
+    not just the first inserted section.
     """
     try:
-        # Get semantic expansion of query
+        # Step 1: Get semantic expansion of query
         expanded_terms = expand_query_semantically(user_query, api_key)
         print(f"Expanded query terms: {expanded_terms}", flush=True)
 
-        # Get ALL documents (or large batch) to search comprehensively
-        # We'll rely on keyword matching rather than TF-IDF for relevance
-        search_results = collection.get(
-            limit=5000,  # Get up to 5000 documents to search
-            include=['documents', 'metadatas']
+        # Step 2: Use TF-IDF semantic search to get candidates from across corpus
+        # This returns documents that are semantically similar to the query
+        # importantly: Chroma returns results across all sources, not just insertion order
+        tfidf_results = collection.query(
+            query_texts=[user_query],
+            n_results=200,  # Get broad semantic coverage
+            include=['documents', 'metadatas', 'distances']
         )
 
-        if not search_results or not search_results.get('documents'):
-            print("No documents found in collection")
+        if not tfidf_results or not tfidf_results.get('documents') or not tfidf_results['documents'][0]:
+            print("No documents found")
             return []
 
-        # Score all results by keyword presence in expanded terms
-        documents = search_results.get('documents', [])
-        metadatas = search_results.get('metadatas', [])
+        # Extract results (Chroma returns nested lists)
+        documents = tfidf_results['documents'][0]
+        metadatas = tfidf_results['metadatas'][0]
+        distances = tfidf_results['distances'][0]
 
+        # Step 3: Score by keyword presence (primary) + TF-IDF (tie-breaker)
         scored_results = []
         for i, doc in enumerate(documents):
             metadata = metadatas[i] if i < len(metadatas) else {}
 
-            # Keyword match score - how many expanded terms appear in document
+            # Count keyword matches
             doc_lower = doc.lower()
             keyword_matches = sum(1 for term in expanded_terms if term in doc_lower)
-            keyword_score = keyword_matches / len(expanded_terms) if expanded_terms else 0
 
-            # Score based primarily on keyword matches
-            # More keyword matches = exponentially higher score
+            # Score: exponential boost for keyword matches + TF-IDF for tiebreaking
             if keyword_matches > 0:
-                combined_score = (keyword_score ** 1.3) * 100  # Exponential boost for keyword matches
-            else:
-                combined_score = 0  # Documents without any keyword matches get 0 score
+                keyword_score = (keyword_matches / len(expanded_terms)) if expanded_terms else 0
+                # Keyword matching is primary (exponential), TF-IDF only for tiebreaking
+                tfidf_score = max(0, 1 - distances[i]) * 0.05  # Only 5% weight
+                combined_score = ((keyword_score ** 1.3) * 100) + tfidf_score
 
-            # Only include documents with at least one keyword match
-            if keyword_matches > 0:
                 scored_results.append({
                     'score': combined_score,
                     'document': doc,
                     'metadata': metadata,
-                    'tfidf_score': 0,  # Not using TF-IDF anymore
-                    'keyword_score': keyword_score,
-                    'keyword_matches': keyword_matches
+                    'keyword_matches': keyword_matches,
+                    'source_name': metadata.get('source_name', 'unknown')
                 })
 
         # Sort by score (highest first)
         scored_results.sort(key=lambda x: x['score'], reverse=True)
 
-        print(f"Found {len(scored_results)} documents with keyword matches", flush=True)
+        print(f"Retrieved {len(scored_results)} documents with keyword matches from {len(set(r['source_name'] for r in scored_results))} sources", flush=True)
+
+        # Show source distribution
+        source_dist = {}
+        for result in scored_results:
+            source = result['source_name']
+            source_dist[source] = source_dist.get(source, 0) + 1
+        print(f"Source distribution: {sorted(source_dist.items(), key=lambda x: x[1], reverse=True)}", flush=True)
 
         # Return top n_results
         return scored_results[:n_results]
