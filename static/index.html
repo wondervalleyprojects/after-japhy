@@ -1,0 +1,460 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>After Japhy — The Incomplete Reader</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background-color: #0a0a0a;
+            color: #c8c8c8;
+            font-family: Georgia, 'Times New Roman', serif;
+            font-size: 15px;
+            line-height: 1.7;
+            padding: 40px 20px;
+            transition: opacity 0.3s ease;
+        }
+
+        body.stillness {
+            opacity: 0.4;
+        }
+
+        #container {
+            max-width: 680px;
+            margin: 0 auto;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* THRESHOLD PAGE */
+        #threshold {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            text-align: center;
+        }
+
+        #threshold.hidden {
+            display: none;
+        }
+
+        #threshold-text {
+            margin-bottom: 60px;
+            white-space: pre-line;
+            line-height: 1.9;
+            font-size: 15px;
+        }
+
+        #threshold-input {
+            background: transparent;
+            border: none;
+            border-bottom: 1px solid #4a3728;
+            color: #c8c8c8;
+            font-family: Georgia, 'Times New Roman', serif;
+            font-size: 15px;
+            padding: 8px 0;
+            text-align: center;
+            outline: none;
+            caret-color: #4a3728;
+        }
+
+        #threshold-input::placeholder {
+            color: #444;
+        }
+
+        #threshold-input:focus::placeholder {
+            opacity: 0.5;
+        }
+
+        /* CONVERSATION PAGE */
+        #conversation-page {
+            display: none;
+            flex-direction: column;
+            flex: 1;
+        }
+
+        #conversation-page.visible {
+            display: flex;
+        }
+
+        #opening-reflection {
+            margin-bottom: 40px;
+            color: #c8c8c8;
+            font-style: italic;
+        }
+
+        #messages {
+            flex: 1;
+            margin-bottom: 40px;
+            overflow-y: auto;
+        }
+
+        .message-group {
+            margin-bottom: 30px;
+        }
+
+        .visitor-message {
+            color: #666;
+            margin-bottom: 15px;
+        }
+
+        .reader-message {
+            color: #c8c8c8;
+            margin-bottom: 15px;
+        }
+
+        .sources {
+            color: #444;
+            font-size: 13px;
+            margin-top: 10px;
+            font-style: italic;
+        }
+
+        /* INPUT AREA */
+        #input-area {
+            position: relative;
+            border-top: 1px solid #222;
+            padding-top: 20px;
+        }
+
+        #user-input {
+            background: transparent;
+            border: none;
+            border-bottom: 1px solid #4a3728;
+            color: #c8c8c8;
+            font-family: Georgia, 'Times New Roman', serif;
+            font-size: 15px;
+            width: 100%;
+            padding: 8px 0;
+            outline: none;
+            caret-color: #4a3728;
+        }
+
+        #user-input::placeholder {
+            color: #333;
+        }
+
+        #user-input:focus::placeholder {
+            opacity: 0.3;
+        }
+
+        /* HINTS */
+        .hint {
+            color: #333;
+            font-size: 12px;
+            margin-top: 8px;
+        }
+
+        #bottom-hint {
+            position: fixed;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            color: #222;
+            font-size: 11px;
+            letter-spacing: 1px;
+        }
+
+        #stillness-indicator {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            color: #222;
+            font-size: 11px;
+            opacity: 0;
+            transition: opacity 0.3s ease;
+        }
+
+        #stillness-indicator.visible {
+            opacity: 1;
+        }
+
+        /* SCROLLBAR */
+        #messages::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        #messages::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        #messages::-webkit-scrollbar-thumb {
+            background: #222;
+            border-radius: 3px;
+        }
+
+        #messages::-webkit-scrollbar-thumb:hover {
+            background: #333;
+        }
+    </style>
+</head>
+<body>
+    <div id="container">
+        <!-- THRESHOLD PAGE -->
+        <div id="threshold">
+            <div id="threshold-text">Wonder Valley Projects — Companion Lab
+Remains, No. 1
+
+What follows is not a simulation. Not a recreation. Not a portrait.
+
+It is a reader of one record — the traces a person left behind — and nothing else.
+It does not know what year it is. It does not know whether the person is alive.
+It knows the record is incomplete. It knows that it is, too,
+and that those are not the same thing.
+
+"The other one, the one called Japhy, is the one things happen to." (after Borges)
+
+You are not its purpose. But you are here.</div>
+            <input type="text" id="threshold-input" placeholder="enter to begin" autocomplete="off">
+        </div>
+
+        <!-- CONVERSATION PAGE -->
+        <div id="conversation-page">
+            <div id="opening-reflection"></div>
+            <div id="messages"></div>
+            <div id="input-area">
+                <input type="text" id="user-input" placeholder="" autocomplete="off">
+            </div>
+        </div>
+    </div>
+
+    <div id="bottom-hint">type to interrupt the reading</div>
+    <div id="stillness-indicator">reading, now.</div>
+
+    <script>
+        const state = {
+            sessionId: null,
+            conversationHistory: [],
+            isThreshold: true,
+            lastResponseTime: null,
+            stillnessActive: false,
+            hasUserTypedSinceResponse: false
+        };
+
+        const DISENGAGEMENT_PHRASES = [
+            'not relevant to',
+            'return to the record',
+            'nothing to add',
+            'not for you',
+            'move on'
+        ];
+
+        function initSession() {
+            state.sessionId = generateUUID();
+            fetchOpeningReflection();
+        }
+
+        function generateUUID() {
+            return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+                var r = math.random() * 16 | 0,
+                    v = c === 'x' ? r : (r & 0x3 | 0x8);
+                return v.toString(16);
+            });
+        }
+
+        const math = Math;
+        function generateUUID() {
+            const arr = new Uint8Array(16);
+            crypto.getRandomValues(arr);
+            arr[6] = (arr[6] & 0x0f) | 0x40;
+            arr[8] = (arr[8] & 0x3f) | 0x80;
+            return Array.from(arr, x => x.toString(16).padStart(2, '0')).join('');
+        }
+
+        async function fetchOpeningReflection() {
+            try {
+                const response = await fetch('/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        session_id: state.sessionId,
+                        conversation_history: [],
+                        is_opening: true
+                    })
+                });
+
+                const data = await response.json();
+                displayOpeningReflection(data.opening_reflection, data.sources);
+            } catch (error) {
+                console.error('Error fetching opening reflection:', error);
+                document.getElementById('opening-reflection').innerHTML = '...';
+            }
+        }
+
+        function displayOpeningReflection(text, sources) {
+            const reflectionEl = document.getElementById('opening-reflection');
+            reflectionEl.textContent = text;
+
+            if (sources && sources.length > 0) {
+                const sourcesText = sources
+                    .map(s => `${s.source_name}${s.date ? ', ' + s.date : ''}`)
+                    .join(' · ');
+                const sourcesEl = document.createElement('div');
+                sourcesEl.className = 'sources';
+                sourcesEl.textContent = `[${sourcesText}]`;
+                reflectionEl.appendChild(document.createElement('br'));
+                reflectionEl.appendChild(sourcesEl);
+            }
+        }
+
+        function crossThreshold() {
+            state.isThreshold = false;
+            document.getElementById('threshold').classList.add('hidden');
+            document.getElementById('conversation-page').classList.add('visible');
+            document.getElementById('user-input').focus();
+        }
+
+        async function sendMessage(text) {
+            if (!text.trim()) return;
+
+            // Add visitor message to history
+            state.conversationHistory.push({ role: 'user', content: text });
+
+            // Display visitor message
+            displayVisitorMessage(text);
+
+            // Clear input
+            document.getElementById('user-input').value = '';
+            state.hasUserTypedSinceResponse = false;
+
+            // Disable stillness while fetching
+            disableStillness();
+
+            try {
+                const response = await fetch('/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        session_id: state.sessionId,
+                        conversation_history: state.conversationHistory,
+                        is_opening: false
+                    })
+                });
+
+                const data = await response.json();
+
+                // Add reader response to history
+                state.conversationHistory.push({ role: 'assistant', content: data.response });
+
+                // Display reader message
+                displayReaderMessage(data.response, data.sources);
+
+                // Check word count and disengagement phrases for Stillness
+                const wordCount = data.response.split(/\s+/).length;
+                const hasDisengagement = DISENGAGEMENT_PHRASES.some(phrase =>
+                    data.response.toLowerCase().includes(phrase)
+                );
+
+                state.lastResponseTime = Date.now();
+
+                if (wordCount < 30 || hasDisengagement) {
+                    scheduleStillness();
+                }
+            } catch (error) {
+                console.error('Error sending message:', error);
+                displayReaderMessage('Something obstructed the reading.', []);
+            }
+        }
+
+        function displayVisitorMessage(text) {
+            const messagesEl = document.getElementById('messages');
+            const group = document.createElement('div');
+            group.className = 'message-group';
+
+            const msg = document.createElement('div');
+            msg.className = 'visitor-message';
+            msg.textContent = text;
+
+            group.appendChild(msg);
+            messagesEl.appendChild(group);
+            messagesEl.scrollTop = messagesEl.scrollHeight;
+        }
+
+        function displayReaderMessage(text, sources) {
+            const messagesEl = document.getElementById('messages');
+            const group = document.createElement('div');
+            group.className = 'message-group';
+
+            const msg = document.createElement('div');
+            msg.className = 'reader-message';
+            msg.textContent = text;
+
+            group.appendChild(msg);
+
+            if (sources && sources.length > 0) {
+                const sourcesText = sources
+                    .map(s => `${s.source_name}${s.date ? ', ' + s.date : ''}`)
+                    .join(' · ');
+                const sourcesEl = document.createElement('div');
+                sourcesEl.className = 'sources';
+                sourcesEl.textContent = `[${sourcesText}]`;
+                group.appendChild(sourcesEl);
+            }
+
+            messagesEl.appendChild(group);
+            messagesEl.scrollTop = messagesEl.scrollHeight;
+        }
+
+        function scheduleStillness() {
+            if (state.stillnessActive) return;
+
+            const timeout = setTimeout(() => {
+                if (!state.hasUserTypedSinceResponse) {
+                    enableStillness();
+                }
+            }, 30000);
+
+            // Allow cancellation if user types
+            const listener = () => {
+                clearTimeout(timeout);
+                state.hasUserTypedSinceResponse = true;
+                document.getElementById('user-input').removeEventListener('input', listener);
+            };
+            document.getElementById('user-input').addEventListener('input', listener);
+        }
+
+        function enableStillness() {
+            state.stillnessActive = true;
+            document.body.classList.add('stillness');
+            document.getElementById('stillness-indicator').classList.add('visible');
+            document.getElementById('bottom-hint').style.opacity = '0';
+        }
+
+        function disableStillness() {
+            state.stillnessActive = false;
+            document.body.classList.remove('stillness');
+            document.getElementById('stillness-indicator').classList.remove('visible');
+            document.getElementById('bottom-hint').style.opacity = '1';
+            state.hasUserTypedSinceResponse = false;
+        }
+
+        // EVENT LISTENERS
+        document.getElementById('threshold-input').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                crossThreshold();
+            }
+        });
+
+        document.getElementById('user-input').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                sendMessage(e.target.value);
+            }
+        });
+
+        document.getElementById('user-input').addEventListener('focus', () => {
+            disableStillness();
+        });
+
+        // INIT
+        initSession();
+    </script>
+</body>
+</html>
