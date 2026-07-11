@@ -30,3 +30,13 @@ Result:
 - chunks_lookup: 31.1 MB
 What fixed it: Short records (tweets, brief notes, email fragments) are skipped; only records ≥50 words chunked. This is acceptable for retrieval — brief records will be filtered during BM25 search anyway.
 Impact on architecture: Retrieval index ready. Phase 4 (core Flask application) can now proceed with working BM25 and SQLite.
+
+## 2026-07-11 — Deploy sizing: measure loaded RAM, not disk
+What happened: Deployment planning initially feared corpus size (53MB) and index size (128MB). Neither mattered. The BM25 pickle (33MB on disk) inflates to 321MB in RAM — ~450MB total app footprint, 3.5× disk. The old render.yaml's `--workers 2` would have doubled that to ~900MB, past any small host's limit.
+What fixed it: Measured RSS directly before choosing a host. Fly.io 1GB machine, 1 gunicorn worker + 4 threads.
+Impact on architecture: Host choice (Fly over Render free/starter tiers) driven entirely by the loaded-RAM number. Fallback lever documented: FTS5's native bm25() could replace the pickle and cut RAM to ~60MB if cost ever matters.
+
+## 2026-07-11 — Spend caps expressed as The Stillness
+What happened: Turn/daily caps needed a visitor-facing behavior. An error message would break the room.
+What fixed it: Cap hit → server returns a non-response (`stillness: true`, empty response, no model call); the client's existing Stillness choreography dims the room. Canon-compliant: the brief lists "simple non-response" as a Stillness trigger, and the model never narrates its own disengagement.
+Impact on architecture: Infrastructure limits absorbed into the piece's own disengagement vocabulary. Generalizable to the Remains series.

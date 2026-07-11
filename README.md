@@ -1,218 +1,102 @@
-# After Japhy: RAG Web App
+# After Japhy — The Incomplete Reader
 
-A retrieval-augmented generation (RAG) web app built from a comprehensive personal corpus. Visitors can engage with an AI reader trained on 75,000+ documents spanning emails, social media, articles, and personal writing.
+*Wonder Valley Projects — Companion Lab No. 1. Remains, No. 1.*
 
-## Architecture
+Not a simulation. Not a recreation. Not a portrait. A reader of one
+record — the traces a person left behind — and nothing else.
 
-### Data Pipeline
-1. **Master Corpus** (75,816 records from original sources)
-   - Gmail accounts (personal & WVP): 28,692 records
-   - Facebook: 21,174 records  
-   - Twitter: 13,975 records
-   - Other sources (Reddit, LinkedIn, articles, etc.)
+This repository holds the v2 application: a Flask web app that deploys
+the reader against a 75,816-record personal corpus using a LazyGraphRAG
+retrieval architecture. The corpus itself, the retrieval index, and all
+session logs are private and never enter git.
 
-2. **Gmail Extraction** (44,294 sent messages)
-   - Personal Gmail: 38,139 sent messages
-   - WVP Gmail: 6,155 sent messages (filtered for financial content)
+## Architecture (v2 — LazyGraphRAG)
 
-3. **Preprocessing** (119,734 records after filtering)
-   - Removed WVP financial records (invoices, payments, etc.)
-   - Removed received Facebook messages
-   - Applied Victorian name-izer for anonymization
-   - Added time period classification
+No embeddings, no vector database, no upfront knowledge graph.
 
-4. **Chunking** (111,744 chunks)
-   - Records split at sentence boundaries into 300-800 token passages
-   - Twitter/Instagram records grouped by date
-   - TF-IDF vectorization using scikit-learn for encoding
+**Index build** (one-time, zero model calls): the anonymized corpus is
+chunked (~400 words, 80-word overlap) into SQLite with an FTS5 full-text
+index, plus a BM25 index (`rank_bm25`) serialized to pickle. 26,860
+chunks, ~128MB on disk, ~450MB in RAM when loaded.
 
-5. **Chroma Vector Database**
-   - Persistent storage with metadata
-   - 111k+ vectors indexed by chunk ID
-   - Enables fast document retrieval for hybrid search
+**Per conversation turn** (2 Haiku calls):
 
-## Setup
+1. **Retrieve** — BM25 top-20 merged with FTS5 top-10, keep top 15
+2. **Extract** — model call #1 pulls entities/relationships from the passages
+3. **Graph** — NetworkX mini-graph built per query; top nodes by degree
+   centrality become a plain-text "thematic web"
+4. **Synthesize** — model call #2: system prompt + passages + thematic
+   web + conversation history → the reader speaks
 
-### Prerequisites
-- Python 3.13+
-- ~2GB disk space for corpus files and Chroma database
-- ANTHROPIC_API_KEY environment variable set
+All model calls pass through `model_seam.py` — provider, endpoint, and
+model name live in that one file only (WVP vendor-independence ruling,
+July 10 2026). Current model: Claude Haiku 4.5.
 
-### Installation
+## Access model
+
+- Unlisted URL + a single shared access word (`GATE_WORD` env var),
+  published inside a paid Substack post. Typed into the threshold page.
+- No user accounts, no email capture, no analytics, no tracking.
+- The reader has no memory of visitors. Neither does the infrastructure,
+  beyond private server-side JSON session logs (`logs/`, or the mounted
+  volume in production).
+- Spend guards: `MAX_TURNS_PER_SESSION` (default 30) and
+  `MAX_REQUESTS_PER_DAY` (default 500). At a cap the reader simply stops
+  responding; the client's Stillness choreography handles the rest.
+
+## Running locally
 
 ```bash
-# Create virtual environment
-python3 -m venv venv
+python3.11 -m venv venv
 source venv/bin/activate
-
-# Install dependencies
-pip install chromadb flask anthropic scikit-learn
-
-# Or install from requirements.txt
 pip install -r requirements.txt
+# .env: ANTHROPIC_API_KEY=... (GATE_WORD optional; gate stands open if unset)
+python app.py                      # http://localhost:5000
+# or, with a test gate word:
+bash scripts/dev_server.sh         # http://localhost:5059, word: mojave
 ```
 
-### Building the Corpus
+Requires `index/` (corpus.db, bm25_index.pkl, chunks_lookup.pkl), built
+via `scripts/build_index.py` from the anonymized corpus.
 
-The corpus build is a multi-step process:
+## Endpoints
 
-```bash
-# 1. Extract sent emails from mbox files (runs in background, ~30-60 mins per file)
-python3 scripts/extract_gmail_sent.py <path_to_mbox> <account_type> <output_file>
+| Route | What |
+|---|---|
+| `GET /` | The threshold, then the encounter |
+| `POST /gate` | `{"word": "..."}` → signed session cookie |
+| `POST /chat` | Gated. Conversation turn or opening reflection |
+| `POST /test/retrieve` | Gated. Retrieval-only, no model calls |
+| `GET /health` | `{"status": "ok", "records": N, "chunks": N}` |
 
-# 2. Preprocess corpus (filter, anonymize, add metadata)
-python3 scripts/preprocess_corpus.py
+## Deployment
 
-# 3. Chunk for embedding (split into semantic passages)
-python3 scripts/chunk_corpus.py
+Fly.io, one always-on 1GB machine, ~$6/month, index baked into the
+image at deploy time. Full walkthrough, secrets setup, cost table, and
+the rotate-word / rotate-key / take-down runbook: **[DEPLOY_GUIDE.md](DEPLOY_GUIDE.md)**.
 
-# 4. Embed and load into Chroma (TF-IDF + Chroma DB)
-python3 scripts/embed_and_load.py
-```
+Shape rationale and rejected alternatives: **[ARCHITECTURE_DECISIONS.md](ARCHITECTURE_DECISIONS.md)**.
 
-### Running the Server
+## Corpus custody
 
-```bash
-source venv/bin/activate
-export ANTHROPIC_API_KEY=sk-...
-python3 app.py
-```
+The corpus is a personal archive first and an index second.
+`scripts/export_corpus_markdown.py` exports all 75,816 records to plain
+markdown files (one per source per year), each record under a provenance
+header (source, date, era, tier). The export lives alongside the master
+corpus, readable with nothing installed.
 
-Server runs on `http://localhost:5000`
+## Scripts
 
-## API
+| Script | Purpose |
+|---|---|
+| `scripts/verify_corpus.py` | Count records against the manifest |
+| `scripts/anonymize_corpus.py` | Victorian name anonymizer (spaCy; needs `requirements-local.txt`) |
+| `scripts/build_index.py` | Chunk + FTS5 + BM25 index build |
+| `scripts/export_corpus_markdown.py` | Portable markdown archive export |
+| `scripts/dev_server.sh` | Local server with a test gate word |
 
-### POST /chat
-Query the corpus with conversational context.
+## Never in git
 
-**Request:**
-```json
-{
-  "message": "What kept coming up for him around 2012?",
-  "history": [
-    {"role": "user", "content": "..."},
-    {"role": "assistant", "content": "..."}
-  ],
-  "session_id": "optional-uuid"
-}
-```
-
-**Response:**
-```json
-{
-  "response": "Based on the corpus...",
-  "sources": [
-    {"source_name": "article", "date": "2012-03-15"},
-    {"source_name": "twitter", "date": "2012-07-22"}
-  ],
-  "session_id": "uuid"
-}
-```
-
-### GET /health
-Health check endpoint. Returns chunk count in collection.
-
-## Data Files
-
-### Generated During Build
-- `master_corpus.jsonl` - All records before preprocessing (75,816 records)
-- `gmail_personal_sent.jsonl` - Extracted personal Gmail (38,139 records)
-- `gmail_wvp_sent.jsonl` - Extracted WVP Gmail (6,155 records)
-- `corpus_clean.jsonl` - After preprocessing (119,734 records)
-- `corpus_chunked.jsonl` - After chunking (111,744 chunks)
-- `chroma_db/` - Vector database directory
-- `logs/` - Session logs (JSON per request)
-
-### Not Committed to Git
-See `.gitignore` for files excluded from version control (corpus files, databases, logs)
-
-## System Prompt
-
-The system prompt is loaded from `system_prompt.txt`. It guides the AI reader's behavior when engaging with the corpus. The prompt emphasizes:
-- Engaging with the personal corpus authentically
-- Citing sources from the retrieved records
-- Acknowledging gaps or uncertainty in the corpus
-- Respecting the diaristic and reflective nature of the content
-
-## Testing
-
-```bash
-source venv/bin/activate
-python3 test_chat.py
-```
-
-Runs five sequential queries with conversation history to test the full pipeline.
-
-## Anonymization
-
-The preprocessing step applies a "Victorian name-izer" to personal communications:
-- Common first names are replaced with initial + em-dash (e.g., "Sarah" → "S—")
-- Protected names are never anonymized: Japhy, Grant, Jeffrey, Orlinski, and public figures
-- Applied to: Gmail, Bear Notes, Facebook messages
-
-## Performance
-
-- **Preprocessing**: ~2 minutes
-- **Chunking**: ~3 minutes
-- **Embedding**: ~5-10 minutes (TF-IDF vectorization on 111k chunks)
-- **Query time**: <500ms average (hybrid search with semantic expansion)
-
-## Troubleshooting
-
-**ImportError: No module named chromadb**
-- Ensure virtual environment is activated: `source venv/bin/activate`
-
-**ANTHROPIC_API_KEY not set**
-- Set environment variable: `export ANTHROPIC_API_KEY=sk-...`
-
-**Chroma connection error**
-- Check that chroma_db/ directory exists and is readable
-- Re-run `python3 scripts/embed_and_load.py` to rebuild
-
-**Out of memory during embedding**
-- TF-IDF vectorizer loads all chunks into memory
-- Reduce batch size in embed_and_load.py if needed
-- Or process in smaller corpus_chunked.jsonl files
-
-## Architecture Decisions
-
-### Hybrid Semantic + Keyword Search
-The retrieval system uses a **hybrid approach** combining semantic understanding with direct keyword matching:
-
-1. **Query Expansion (Claude API)**
-   - User query analyzed semantically by Claude to understand intent
-   - Generates 4-6 related search terms, synonyms, and thematic concepts
-   - Example: "happiest moments" → ["happiness", "joy", "contentment", "celebration", "achievement"]
-
-2. **Document Retrieval**
-   - All documents retrieved from Chroma database (up to 5000)
-   - Documents scored primarily by keyword presence in expanded terms
-   - Exponential boost given to documents with multiple keyword matches
-   - Documents with zero keyword matches scored as 0 (filtered out)
-
-3. **Why Hybrid Over TF-IDF Alone**
-   - TF-IDF is a bag-of-words approach that doesn't understand semantic intent
-   - Hybrid approach enables finding conceptually related material (e.g., "joy" for "happiest moments")
-   - Avoids repeatedly returning the same statistically similar documents
-   - Ensures retrieved material is thematically relevant, not just statistically frequent
-
-### TF-IDF Vectorization
-- Scikit-learn TF-IDF used for document encoding into Chroma
-- Avoids PyTorch/sentence-transformers dependency issues
-- Scales well to 100k+ chunks
-- Used for initial document representation and retrieval mechanism
-
-### Chroma for Vector Storage
-- Persistent storage without additional infrastructure
-- Enables efficient document retrieval for hybrid search
-- Metadata filtering support
-- Single-file database format
-
-### Session Logging
-- Every conversation logged to JSON for auditability
-- Includes message, history, retrieved chunks (with keyword match counts), and response
-- Enables analysis of what the corpus reveals and how retrieval performs
-
-## License
-
-See LICENSE file (if present)
+`.env`, the corpus (`master_corpus*.jsonl`), the index (`index/`,
+`*.pkl`, `*.db`), session logs (`logs/`), and the name mapping
+(`name_mapping_log.json`). See `.gitignore`.
