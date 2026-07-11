@@ -253,15 +253,6 @@ You are not its purpose. But you are here.</div>
         }
 
         function generateUUID() {
-            return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
-                var r = math.random() * 16 | 0,
-                    v = c === 'x' ? r : (r & 0x3 | 0x8);
-                return v.toString(16);
-            });
-        }
-
-        const math = Math;
-        function generateUUID() {
             const arr = new Uint8Array(16);
             crypto.getRandomValues(arr);
             arr[6] = (arr[6] & 0x0f) | 0x40;
@@ -305,11 +296,32 @@ You are not its purpose. But you are here.</div>
             }
         }
 
+        async function attemptThreshold(word) {
+            try {
+                const response = await fetch('/gate', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ word: word })
+                });
+
+                if (response.ok) {
+                    crossThreshold();
+                } else {
+                    // The wrong word. The threshold does not explain itself.
+                    const input = document.getElementById('threshold-input');
+                    input.value = '';
+                }
+            } catch (error) {
+                console.error('Gate error:', error);
+            }
+        }
+
         function crossThreshold() {
             state.isThreshold = false;
             document.getElementById('threshold').classList.add('hidden');
             document.getElementById('conversation-page').classList.add('visible');
             document.getElementById('user-input').focus();
+            initSession();
         }
 
         async function sendMessage(text) {
@@ -340,6 +352,14 @@ You are not its purpose. But you are here.</div>
                 });
 
                 const data = await response.json();
+
+                // Non-response: the reader's attention has returned to the
+                // record. Nothing is displayed; the room dims.
+                if (data.stillness || !data.response) {
+                    state.lastResponseTime = Date.now();
+                    setTimeout(() => enableStillness(), 2500);
+                    return;
+                }
 
                 // Add reader response to history
                 state.conversationHistory.push({ role: 'assistant', content: data.response });
@@ -439,7 +459,7 @@ You are not its purpose. But you are here.</div>
         // EVENT LISTENERS
         document.getElementById('threshold-input').addEventListener('keypress', (e) => {
             if (e.key === 'Enter') {
-                crossThreshold();
+                attemptThreshold(e.target.value);
             }
         });
 
@@ -453,8 +473,9 @@ You are not its purpose. But you are here.</div>
             disableStillness();
         });
 
-        // INIT
-        initSession();
+        // The session begins only after the threshold is crossed —
+        // no model call is spent on a page that is merely opened.
+        document.getElementById('threshold-input').focus();
     </script>
 </body>
 </html>

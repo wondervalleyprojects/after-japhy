@@ -2,26 +2,48 @@
 
 import os
 import json
+import re
+import time
+import threading
 import uuid
 import pickle
 import sqlite3
-from datetime import datetime
+from datetime import datetime, date
+from functools import wraps
 from pathlib import Path
-from flask import Flask, request, jsonify
-from anthropic import Anthropic
+from flask import Flask, request, jsonify, session
+from dotenv import load_dotenv
 import networkx as nx
 from rank_bm25 import BM25Okapi
 
+import model_seam
+
+load_dotenv()
+
 app = Flask(__name__)
+
+# Session cookie signing. Set SECRET_KEY in the environment for production;
+# without it, gate cookies are invalidated on every restart.
+app.secret_key = os.environ.get("SECRET_KEY") or os.urandom(32)
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+
+# Gating: a single shared access word, published inside a paid Substack post.
+# If GATE_WORD is unset (local development), the gate stands open.
+GATE_WORD = os.environ.get("GATE_WORD", "").strip().lower()
+
+# Spend guards: a shared link must not be able to drain the API key.
+MAX_TURNS_PER_SESSION = int(os.environ.get("MAX_TURNS_PER_SESSION", "30"))
+MAX_REQUESTS_PER_DAY = int(os.environ.get("MAX_REQUESTS_PER_DAY", "500"))
 
 # Paths
 PROJECT_ROOT = Path(__file__).parent
 INDEX_DIR = PROJECT_ROOT / "index"
-LOGS_DIR = PROJECT_ROOT / "logs"
+LOGS_DIR = Path(os.environ.get("LOGS_DIR", PROJECT_ROOT / "logs"))
 STATIC_DIR = PROJECT_ROOT / "static"
 
 # Ensure directories exist
-LOGS_DIR.mkdir(exist_ok=True)
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
 INDEX_DIR.mkdir(exist_ok=True)
 
 # Load system prompt
@@ -66,6 +88,48 @@ def load_database():
 BM25_INDEX, CHUNKS_LOOKUP = load_indexes()
 DB = load_database()
 
+# ---------------------------------------------------------------------------
+# Gate and spend guards
+# ---------------------------------------------------------------------------
+
+def require_gate(f):
+    """Endpoints behind the access word. The gate stands open when GATE_WORD
+    is unset (local development)."""
+    @wraps(f)
+    def wrapped(*args, **kwargs):
+        if GATE_WORD and not session.get("gated"):
+            return jsonify({"error": "gated"}), 403
+        return f(*args, **kwargs)
+    return wrapped
+
+
+_daily_lock = threading.Lock()
+_DAILY_COUNTER_FILE = LOGS_DIR / "daily_requests.json"
+
+
+def daily_budget_spent():
+    """Count today's model-calling requests against MAX_REQUESTS_PER_DAY.
+    Returns True when the day's budget is exhausted. The counter lives on
+    disk so it survives restarts."""
+    today = date.today().isoformat()
+    with _daily_lock:
+        counter = {"date": today, "count": 0}
+        try:
+            with open(_DAILY_COUNTER_FILE) as f:
+                stored = json.load(f)
+            if stored.get("date") == today:
+                counter = stored
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+
+        if counter["count"] >= MAX_REQUESTS_PER_DAY:
+            return True
+
+        counter["count"] += 1
+        with open(_DAILY_COUNTER_FILE, "w") as f:
+            json.dump(counter, f)
+    return False
+
 def get_chunk_text(chunk_id):
     """Get chunk text from lookup dictionary."""
     if CHUNKS_LOOKUP is None:
@@ -95,6 +159,12 @@ def fts5_search(query, top_k=10):
     if DB is None:
         return []
 
+    # Strip FTS5 operator syntax: raw visitor text (apostrophes, quotes,
+    # colons) is a MATCH syntax error otherwise.
+    sanitized = " ".join(re.findall(r"[A-Za-z0-9]+", query))
+    if not sanitized:
+        return []
+
     try:
         cursor = DB.cursor()
         # FTS5 query syntax
@@ -103,7 +173,7 @@ def fts5_search(query, top_k=10):
             WHERE corpus_fts MATCH ?
             ORDER BY rank
             LIMIT ?
-        """, (query, top_k))
+        """, (sanitized, top_k))
 
         results = cursor.fetchall()
         return [(chunk_id, 1.0 / (abs(rank) + 1)) for chunk_id, rank in results]
@@ -127,10 +197,8 @@ def retrieve_top_chunks(query, top_k=15):
     sorted_chunks = sorted(combined.items(), key=lambda x: x[1], reverse=True)[:top_k]
     return [chunk_id for chunk_id, _ in sorted_chunks]
 
-def extract_entities_and_relationships(chunks, api_key):
-    """Use Claude Haiku to extract entities and relationships from passages."""
-    client = Anthropic(api_key=api_key)
-
+def extract_entities_and_relationships(chunks):
+    """Extract entities and relationships from passages (model call #1)."""
     # Format chunks for extraction
     passages_text = "\n\n".join([f"[{chunk}]" for chunk in chunks])
 
@@ -147,13 +215,10 @@ Passages:
 {passages_text}"""
 
     try:
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
+        text = model_seam.complete(
+            messages=[{"role": "user", "content": prompt}],
             max_tokens=1500,
-            messages=[{"role": "user", "content": prompt}]
-        )
-
-        text = response.content[0].text.strip()
+        ).strip()
         # Extract JSON from response
         try:
             if "```json" in text:
@@ -228,10 +293,8 @@ def get_chunk_metadata(chunk_id):
 
     return None
 
-def synthesize_response(query, context_passages, thematic_web, conversation_history, api_key):
-    """Use Claude Haiku to synthesize a response."""
-    client = Anthropic(api_key=api_key)
-
+def synthesize_response(query, context_passages, thematic_web, conversation_history):
+    """Synthesize the reader's response (model call #2)."""
     # Format context
     context_text = "\n\n".join(context_passages[:10])  # Limit context
 
@@ -248,19 +311,16 @@ def synthesize_response(query, context_passages, thematic_web, conversation_hist
 """
 
     try:
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=400,
+        return model_seam.complete(
+            messages=conversation_history,
             system=system_with_context,
-            messages=conversation_history
+            max_tokens=400,
         )
-
-        return response.content[0].text
     except Exception as e:
         print(f"Synthesis error: {e}")
-        return f"Something obstructed the reading. ({str(e)})"
+        return "Something obstructed the reading."
 
-def get_opening_reflection(api_key):
+def get_opening_reflection():
     """Generate opening reflection from a random chunk."""
     if CHUNKS_LOOKUP is None or DB is None:
         return "The record awaits.", []
@@ -272,21 +332,15 @@ def get_opening_reflection(api_key):
     chunk_text = get_chunk_text(random_chunk_id)
     metadata = get_chunk_metadata(random_chunk_id)
 
-    # Get reflection from Haiku on this chunk
-    client = Anthropic(api_key=api_key)
-
     prompt = f"""Given this excerpt from a personal record, write a single reflective sentence (under 30 words) that captures what matters in it. Do not explain. Just notice.
 
 Excerpt: {chunk_text[:300]}"""
 
     try:
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
+        reflection = model_seam.complete(
+            messages=[{"role": "user", "content": prompt}],
             max_tokens=100,
-            messages=[{"role": "user", "content": prompt}]
-        )
-
-        reflection = response.content[0].text.strip()
+        ).strip()
         sources = [metadata] if metadata else []
 
         return reflection, sources
@@ -331,7 +385,26 @@ def health():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
+@app.route('/gate', methods=['POST'])
+def gate():
+    """Check the access word and open the gate for this session."""
+    if not GATE_WORD:
+        session["gated"] = True
+        return jsonify({"ok": True})
+
+    data = request.json or {}
+    word = str(data.get("word", "")).strip().lower()
+
+    if word == GATE_WORD:
+        session["gated"] = True
+        return jsonify({"ok": True})
+
+    time.sleep(0.5)  # tarpit brute-force attempts
+    return jsonify({"ok": False}), 403
+
+
 @app.route('/chat', methods=['POST'])
+@require_gate
 def chat():
     """Main conversation endpoint (LazyGraphRAG)."""
     data = request.json
@@ -339,13 +412,21 @@ def chat():
     conversation_history = data.get('conversation_history', [])
     is_opening = data.get('is_opening', False)
 
-    api_key = os.environ.get('ANTHROPIC_API_KEY')
-    if not api_key:
-        return jsonify({"error": "ANTHROPIC_API_KEY not set"}), 500
+    # Spend guards. When a cap is hit the reader simply stops responding —
+    # a non-response, which the client's Stillness choreography handles.
+    # The model is never asked to narrate its own disengagement.
+    turns_used = sum(1 for m in conversation_history if m.get('role') == 'user')
+    if turns_used > MAX_TURNS_PER_SESSION or daily_budget_spent():
+        return jsonify({
+            "response": "",
+            "sources": [],
+            "session_id": session_id,
+            "stillness": True
+        })
 
     # Opening reflection
     if is_opening:
-        reflection, sources = get_opening_reflection(api_key)
+        reflection, sources = get_opening_reflection()
         return jsonify({
             "opening_reflection": reflection,
             "sources": sources,
@@ -363,7 +444,7 @@ def chat():
     context_passages = [get_chunk_text(chunk_id) for chunk_id in top_chunks]
 
     # Step 2: Entity extraction
-    extracted = extract_entities_and_relationships(context_passages[:10], api_key)
+    extracted = extract_entities_and_relationships(context_passages[:10])
 
     # Step 3: Mini-graph construction
     thematic_web = build_mini_graph(extracted)
@@ -373,8 +454,7 @@ def chat():
         user_message,
         context_passages,
         thematic_web,
-        conversation_history,
-        api_key
+        conversation_history
     )
 
     # Get sources
@@ -400,6 +480,7 @@ def chat():
     })
 
 @app.route('/test/retrieve', methods=['POST'])
+@require_gate
 def test_retrieve():
     """Test retrieval without LLM call."""
     data = request.json

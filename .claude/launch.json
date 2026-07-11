@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "after-japhy-dev",
+      "runtimeExecutable": "/bin/bash",
+      "runtimeArgs": ["/Users/jeffreyorlinski/Desktop/WVP/Apps/After Japhy/AfterJaphy/scripts/dev_server.sh"],
+      "port": 5059
+    }
+  ]
+}

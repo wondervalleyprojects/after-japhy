@@ -1,0 +1,5 @@
+# Local-only tooling — NOT installed on the server.
+# Used by scripts/anonymize_corpus.py (one-time corpus preparation).
+# After installing: python -m spacy download en_core_web_sm
+-r requirements.txt
+spacy>=3.7
