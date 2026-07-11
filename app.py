@@ -4,559 +4,424 @@ import os
 import json
 import uuid
 import pickle
+import sqlite3
 from datetime import datetime
+from pathlib import Path
 from flask import Flask, request, jsonify
-import chromadb
 from anthropic import Anthropic
-import numpy as np
-import re
+import networkx as nx
+from rank_bm25 import BM25Okapi
 
 app = Flask(__name__)
 
+# Paths
+PROJECT_ROOT = Path(__file__).parent
+INDEX_DIR = PROJECT_ROOT / "index"
+LOGS_DIR = PROJECT_ROOT / "logs"
+STATIC_DIR = PROJECT_ROOT / "static"
+
+# Ensure directories exist
+LOGS_DIR.mkdir(exist_ok=True)
+INDEX_DIR.mkdir(exist_ok=True)
+
 # Load system prompt
 def load_system_prompt():
-    prompt_path = os.path.join(os.path.dirname(__file__), 'system_prompt.txt')
+    prompt_path = PROJECT_ROOT / "system_prompt.txt"
     try:
         with open(prompt_path, 'r') as f:
             return f.read()
     except FileNotFoundError:
-        return "You are an AI reader engaging with a corpus of personal writing."
+        return "You are The Incomplete Reader."
 
-# Load TF-IDF vectorizer for query embedding
-def load_vectorizer():
-    vectorizer_path = os.path.join(os.path.dirname(__file__), 'tfidf_vectorizer.pkl')
-    try:
-        with open(vectorizer_path, 'rb') as f:
-            return pickle.load(f)
-    except FileNotFoundError:
-        print("WARNING: tfidf_vectorizer.pkl not found. Queries will fail.")
+SYSTEM_PROMPT = load_system_prompt()
+
+# Load indexes
+def load_indexes():
+    """Load BM25 index and chunks lookup from pickle files."""
+    bm25_path = INDEX_DIR / "bm25_index.pkl"
+    chunks_path = INDEX_DIR / "chunks_lookup.pkl"
+
+    if not bm25_path.exists() or not chunks_path.exists():
+        print("WARNING: Index files not found. Build indexes first with scripts/build_index.py")
+        return None, None
+
+    with open(bm25_path, 'rb') as f:
+        bm25_index = pickle.load(f)
+
+    with open(chunks_path, 'rb') as f:
+        chunks_lookup = pickle.load(f)
+
+    return bm25_index, chunks_lookup
+
+# Load database
+def load_database():
+    """Load SQLite database with FTS5 index."""
+    db_path = INDEX_DIR / "corpus.db"
+    if not db_path.exists():
+        print("WARNING: corpus.db not found. Build index first with scripts/build_index.py")
         return None
 
-# Load system prompt at startup
-SYSTEM_PROMPT = load_system_prompt()
-chroma_client = chromadb.PersistentClient(path=os.path.join(os.path.dirname(__file__), 'chroma_db'))
-collection = chroma_client.get_or_create_collection(name='after_japhy')
-vectorizer = load_vectorizer()
+    return sqlite3.connect(str(db_path), check_same_thread=False)
 
-# Ensure logs directory exists
-LOGS_DIR = os.path.join(os.path.dirname(__file__), 'logs')
-os.makedirs(LOGS_DIR, exist_ok=True)
+BM25_INDEX, CHUNKS_LOOKUP = load_indexes()
+DB = load_database()
 
-def expand_query_semantically(user_query, api_key):
-    """
-    Use Claude to understand the semantic intent of a query and generate
-    related search terms for hybrid keyword matching.
-    """
+def get_chunk_text(chunk_id):
+    """Get chunk text from lookup dictionary."""
+    if CHUNKS_LOOKUP is None:
+        return ""
+    return CHUNKS_LOOKUP.get(chunk_id, "")
+
+def bm25_search(query, top_k=20):
+    """BM25 search over chunks."""
+    if BM25_INDEX is None or CHUNKS_LOOKUP is None:
+        return []
+
+    # Query is tokenized the same way corpus was tokenized
+    query_tokens = query.lower().split()
+    scores = BM25_INDEX.get_scores(query_tokens)
+
+    # Get top-k by score
+    top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
+
+    # Map back to chunk IDs
+    chunk_ids = list(CHUNKS_LOOKUP.keys())
+    results = [(chunk_ids[i], scores[i]) for i in top_indices if scores[i] > 0]
+
+    return results
+
+def fts5_search(query, top_k=10):
+    """Full-text search via SQLite FTS5."""
+    if DB is None:
+        return []
+
     try:
-        client = Anthropic(api_key=api_key)
+        cursor = DB.cursor()
+        # FTS5 query syntax
+        cursor.execute("""
+            SELECT chunk_id, rank FROM corpus_fts
+            WHERE corpus_fts MATCH ?
+            ORDER BY rank
+            LIMIT ?
+        """, (query, top_k))
 
-        prompt = f"""Given this query about a text corpus, generate 4-6 related search terms that would help find relevant material.
+        results = cursor.fetchall()
+        return [(chunk_id, 1.0 / (abs(rank) + 1)) for chunk_id, rank in results]
+    except Exception as e:
+        print(f"FTS5 search error: {e}")
+        return []
 
-Query: "{user_query}"
+def retrieve_top_chunks(query, top_k=15):
+    """Retrieve top chunks via BM25 + FTS5 hybrid."""
+    bm25_results = bm25_search(query, top_k=20)
+    fts5_results = fts5_search(query, top_k=10)
 
-Return ONLY a comma-separated list of search terms (no explanations, no quotes).
-Focus on synonyms, related concepts, key entities, emotional/thematic elements.
+    # Combine by chunk_id, merge scores
+    combined = {}
+    for chunk_id, score in bm25_results:
+        combined[chunk_id] = combined.get(chunk_id, 0) + score
+    for chunk_id, score in fts5_results:
+        combined[chunk_id] = combined.get(chunk_id, 0) + score
 
-Search terms:"""
+    # Sort by combined score, keep top-k
+    sorted_chunks = sorted(combined.items(), key=lambda x: x[1], reverse=True)[:top_k]
+    return [chunk_id for chunk_id, _ in sorted_chunks]
 
+def extract_entities_and_relationships(chunks, api_key):
+    """Use Claude Haiku to extract entities and relationships from passages."""
+    client = Anthropic(api_key=api_key)
+
+    # Format chunks for extraction
+    passages_text = "\n\n".join([f"[{chunk}]" for chunk in chunks])
+
+    prompt = f"""Extract entities and relationships from these passages.
+
+Return JSON with this structure:
+{{"entities": [{{"name": "...", "type": "...", "weight": N}}], "relationships": [{{"from": "...", "to": "...", "label": "...", "strength": N}}]}}
+
+Entity types: THEME, PERSON, PLACE, PERIOD, EMOTION, BELIEF, PROJECT
+Weight: 1-5 scale (frequency × significance)
+Relationships: co-occurrence, contradiction, evolution, cause, recurrence
+
+Passages:
+{passages_text}"""
+
+    try:
         response = client.messages.create(
-            model="claude-opus-4-7",
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1500,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        text = response.content[0].text.strip()
+        # Extract JSON from response
+        try:
+            if "```json" in text:
+                text = text.split("```json")[1].split("```")[0]
+            elif "{" in text:
+                text = text[text.find("{"):text.rfind("}")+1]
+            return json.loads(text)
+        except:
+            return {"entities": [], "relationships": []}
+
+    except Exception as e:
+        print(f"Entity extraction error: {e}")
+        return {"entities": [], "relationships": []}
+
+def build_mini_graph(extracted_data):
+    """Build a mini-graph from extracted entities and relationships."""
+    g = nx.DiGraph()
+
+    # Add nodes with weights
+    entities = extracted_data.get("entities", [])
+    for entity in entities:
+        weight = entity.get("weight", 1)
+        g.add_node(entity["name"], type=entity.get("type", ""), weight=weight)
+
+    # Add edges with weights
+    relationships = extracted_data.get("relationships", [])
+    for rel in relationships:
+        g.add_edge(rel["from"], rel["to"], label=rel.get("label", ""), strength=rel.get("strength", 1))
+
+    # Get top nodes by weighted degree centrality
+    if g.number_of_nodes() > 0:
+        centrality = nx.degree_centrality(g)
+        top_nodes = sorted(centrality.items(), key=lambda x: x[1], reverse=True)[:5]
+
+        # Format as text
+        thematic_web = "Thematic web: "
+        for node, _ in top_nodes:
+            successors = list(g.successors(node))
+            predecessors = list(g.predecessors(node))
+
+            relations = []
+            for succ in successors:
+                edge_label = g[node][succ].get("label", "→")
+                relations.append(f"{node} —{edge_label}→ {succ}")
+            for pred in predecessors:
+                edge_label = g[pred][node].get("label", "←")
+                relations.append(f"{pred} —{edge_label}→ {node}")
+
+            thematic_web += " · ".join(relations[:2]) + " "
+
+        return thematic_web.strip()
+
+    return "Thematic web: (sparse)"
+
+def get_chunk_metadata(chunk_id):
+    """Get metadata (source_name, date) for a chunk from database."""
+    if DB is None:
+        return None
+
+    try:
+        cursor = DB.cursor()
+        cursor.execute("""
+            SELECT source_name, date FROM chunks
+            WHERE chunk_id = ?
+        """, (chunk_id,))
+
+        result = cursor.fetchone()
+        if result:
+            return {"source_name": result[0], "date": result[1]}
+    except Exception as e:
+        print(f"Error fetching metadata: {e}")
+
+    return None
+
+def synthesize_response(query, context_passages, thematic_web, conversation_history, api_key):
+    """Use Claude Haiku to synthesize a response."""
+    client = Anthropic(api_key=api_key)
+
+    # Format context
+    context_text = "\n\n".join(context_passages[:10])  # Limit context
+
+    # Build system message with context
+    system_with_context = f"""{SYSTEM_PROMPT}
+
+## CORPUS PASSAGES (this turn)
+
+{context_text}
+
+## THEMATIC WEB
+
+{thematic_web}
+"""
+
+    try:
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=400,
+            system=system_with_context,
+            messages=conversation_history
+        )
+
+        return response.content[0].text
+    except Exception as e:
+        print(f"Synthesis error: {e}")
+        return f"Something obstructed the reading. ({str(e)})"
+
+def get_opening_reflection(api_key):
+    """Generate opening reflection from a random chunk."""
+    if CHUNKS_LOOKUP is None or DB is None:
+        return "The record awaits.", []
+
+    import random
+
+    # Pick a random chunk
+    random_chunk_id = random.choice(list(CHUNKS_LOOKUP.keys()))
+    chunk_text = get_chunk_text(random_chunk_id)
+    metadata = get_chunk_metadata(random_chunk_id)
+
+    # Get reflection from Haiku on this chunk
+    client = Anthropic(api_key=api_key)
+
+    prompt = f"""Given this excerpt from a personal record, write a single reflective sentence (under 30 words) that captures what matters in it. Do not explain. Just notice.
+
+Excerpt: {chunk_text[:300]}"""
+
+    try:
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
             max_tokens=100,
             messages=[{"role": "user", "content": prompt}]
         )
 
-        terms_text = response.content[0].text.strip()
-        terms = [t.strip().lower() for t in terms_text.split(',')]
-        return [user_query.lower()] + terms
+        reflection = response.content[0].text.strip()
+        sources = [metadata] if metadata else []
+
+        return reflection, sources
     except Exception as e:
-        print(f"Error expanding query: {e}")
-        return [user_query.lower()]
+        print(f"Opening reflection error: {e}")
+        return "The record awaits.", []
 
-def hybrid_search(user_query, api_key, collection, vectorizer, n_results=8):
-    """
-    Perform hybrid semantic + keyword search across ENTIRE corpus:
-    1. Expand query semantically using Claude to understand thematic intent
-    2. Use TF-IDF semantic search to retrieve candidates from across corpus
-    3. Score primarily by keyword matches in expanded terms
-    4. Return top results with diverse sources
+def log_session(session_id, turn_data):
+    """Log a conversation turn to JSONL file."""
+    log_file = LOGS_DIR / f"{session_id}.jsonl"
 
-    Key insight: Keyword boosting on semantically-retrieved documents ensures
-    we pull from the whole corpus (TF-IDF retrieves from all sources),
-    not just the first inserted section.
-    """
+    with open(log_file, 'a') as f:
+        f.write(json.dumps(turn_data) + "\n")
+
+@app.route('/')
+def index():
+    """Serve the frontend HTML."""
+    frontend_path = STATIC_DIR / "index.html"
+    if frontend_path.exists():
+        with open(frontend_path, 'r') as f:
+            return f.read()
+    return "Frontend not found", 404
+
+@app.route('/health')
+def health():
+    """Health check endpoint."""
+    if DB is None or BM25_INDEX is None:
+        return jsonify({"status": "error", "message": "Indexes not loaded"}), 500
+
     try:
-        # Step 1: Get semantic expansion of query
-        expanded_terms = expand_query_semantically(user_query, api_key)
-        print(f"Expanded query terms: {expanded_terms}", flush=True)
+        cursor = DB.cursor()
+        cursor.execute("SELECT COUNT(*) FROM chunks")
+        chunk_count = cursor.fetchone()[0]
 
-        # Step 2: Use TF-IDF semantic search to get candidates from across corpus
-        # This returns documents that are semantically similar to the query
-        # importantly: Chroma returns results across all sources, not just insertion order
-        tfidf_results = collection.query(
-            query_texts=[user_query],
-            n_results=200,  # Get broad semantic coverage
-            include=['documents', 'metadatas', 'distances']
-        )
+        record_count = len(CHUNKS_LOOKUP) if CHUNKS_LOOKUP else 0
 
-        if not tfidf_results or not tfidf_results.get('documents') or not tfidf_results['documents'][0]:
-            print("No documents found")
-            return []
-
-        # Extract results (Chroma returns nested lists)
-        documents = tfidf_results['documents'][0]
-        metadatas = tfidf_results['metadatas'][0]
-        distances = tfidf_results['distances'][0]
-
-        # Step 3: Score by keyword presence (primary) + TF-IDF (tie-breaker)
-        scored_results = []
-        for i, doc in enumerate(documents):
-            metadata = metadatas[i] if i < len(metadatas) else {}
-
-            # Count keyword matches
-            doc_lower = doc.lower()
-            keyword_matches = sum(1 for term in expanded_terms if term in doc_lower)
-
-            # Score: exponential boost for keyword matches + TF-IDF for tiebreaking
-            if keyword_matches > 0:
-                keyword_score = (keyword_matches / len(expanded_terms)) if expanded_terms else 0
-                # Keyword matching is primary (exponential), TF-IDF only for tiebreaking
-                tfidf_score = max(0, 1 - distances[i]) * 0.05  # Only 5% weight
-                combined_score = ((keyword_score ** 1.3) * 100) + tfidf_score
-
-                scored_results.append({
-                    'score': combined_score,
-                    'document': doc,
-                    'metadata': metadata,
-                    'keyword_matches': keyword_matches,
-                    'source_name': metadata.get('source_name', 'unknown')
-                })
-
-        # Sort by score (highest first)
-        scored_results.sort(key=lambda x: x['score'], reverse=True)
-
-        print(f"Retrieved {len(scored_results)} documents with keyword matches from {len(set(r['source_name'] for r in scored_results))} sources", flush=True)
-
-        # Show source distribution
-        source_dist = {}
-        for result in scored_results:
-            source = result['source_name']
-            source_dist[source] = source_dist.get(source, 0) + 1
-        print(f"Source distribution: {sorted(source_dist.items(), key=lambda x: x[1], reverse=True)}", flush=True)
-
-        # Return top n_results
-        return scored_results[:n_results]
-
+        return jsonify({
+            "status": "ok",
+            "records": record_count,
+            "chunks": chunk_count
+        })
     except Exception as e:
-        print(f"Hybrid search error: {e}", flush=True)
-        import traceback
-        traceback.print_exc()
-        return []
-
-def get_opening_reflection(api_key):
-    """Get a random corpus chunk and generate an opening reflection on it."""
-    try:
-        # Get a random chunk by querying with a random vector
-        # Generate random vector matching TF-IDF dimensions
-        random_vector = np.random.random(vectorizer.transform(['test']).shape[1]).tolist()
-
-        search_results = collection.query(
-            query_embeddings=[random_vector],
-            n_results=1
-        )
-
-        if not search_results or not search_results.get('documents') or not search_results['documents'][0]:
-            print("Warning: No random chunk found")
-            return None
-
-        chunk_content = search_results['documents'][0][0] if search_results['documents'][0] else None
-        if not chunk_content:
-            print("Warning: No chunk content found")
-            return None
-
-        # Generate a reflection on this chunk
-        reflection_prompt = f"""You are mid-thought about this passage from the record:
-
-"{chunk_content}"
-
-Generate a brief, internal reflection—something you're turning over in your mind about this passage. Not an analysis. A fragment of thinking. Start with "..." as if you've been reading already.
-
-Keep it to 2-3 sentences. Something like:
-- "...the same question, again. Hard to say when."
-- "...I keep finding this word."
-- "...what was he reaching for in this moment"
-
-Start with "..." and make it sound like you're in the middle of something."""
-
-        client = Anthropic(api_key=api_key)
-        reflection_response = client.messages.create(
-            model='claude-sonnet-4-5',
-            max_tokens=150,
-            system="You are generating internal monologue—a reader's brief reflection. Minimal, literary, in media res. No punctuation flourishes. Just thinking.",
-            messages=[{'role': 'user', 'content': reflection_prompt}]
-        )
-
-        text = reflection_response.content[0].text
-        print(f"Generated opening reflection: {text[:50]}...")
-        return text
-    except Exception as e:
-        print(f"Error generating opening reflection: {e}", flush=True)
-        import traceback
-        traceback.print_exc()
-        return None
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route('/chat', methods=['POST'])
 def chat():
-    try:
-        # Get API key from environment at request time
-        api_key = os.getenv('ANTHROPIC_API_KEY')
-        if not api_key:
-            return jsonify({'error': 'ANTHROPIC_API_KEY environment variable is not set'}), 500
+    """Main conversation endpoint (LazyGraphRAG)."""
+    data = request.json
+    session_id = data.get('session_id', str(uuid.uuid4()))
+    conversation_history = data.get('conversation_history', [])
+    is_opening = data.get('is_opening', False)
 
-        # Create Anthropic client
-        client = Anthropic(api_key=api_key)
+    api_key = os.environ.get('ANTHROPIC_API_KEY')
+    if not api_key:
+        return jsonify({"error": "ANTHROPIC_API_KEY not set"}), 500
 
-        # Parse request
-        data = request.get_json()
-        if not data:
-            return jsonify({'error': 'Request body must be JSON'}), 400
-
-        message = data.get('message')
-        if not message:
-            return jsonify({'error': 'message field is required'}), 400
-
-        history = data.get('history', [])
-        session_id = data.get('session_id') or str(uuid.uuid4())
-
-        # Special case: opening reflection request (message is "..." and no history)
-        if message == '...' and len(history) == 0:
-            opening_reflection = get_opening_reflection(api_key)
-            return jsonify({
-                'response': '',
-                'opening_reflection': opening_reflection,
-                'sources': [],
-                'session_id': session_id
-            })
-
-        # Perform hybrid semantic + keyword search - retrieve on EVERY turn
-        if not vectorizer:
-            return jsonify({'error': 'TF-IDF vectorizer not loaded'}), 500
-
-        try:
-            scored_results = hybrid_search(message, api_key, collection, vectorizer, n_results=8)
-        except Exception as e:
-            print(f"Hybrid search error: {e}")
-            import traceback
-            traceback.print_exc()
-            return jsonify({'error': f'Search failed: {str(e)}'}), 500
-
-        # Extract retrieved chunks with metadata - these go into EVERY response
-        retrieved_chunks = []
-        for result in scored_results:
-            metadata = result['metadata']
-            retrieved_chunks.append({
-                'source_name': metadata.get('source_name', 'unknown'),
-                'date': metadata.get('date', 'unknown'),
-                'content': result['document'],
-                'keyword_matches': result['keyword_matches'],
-                'combined_score': result['score']
-            })
-
-        # Build Claude API request
-        messages = []
-
-        # Check if this is the first turn
-        is_first_turn = len(history) == 0
-        opening_reflection = None
-
-        if is_first_turn:
-            # Generate opening reflection from corpus
-            opening_reflection = get_opening_reflection(api_key)
-            if opening_reflection:
-                # Add opening as initial context
-                messages.append({
-                    'role': 'assistant',
-                    'content': opening_reflection
-                })
-
-        # Add conversation history (excludes opening reflection)
-        for hist_msg in history:
-            messages.append(hist_msg)
-
-        # Always include retrieved chunks as context with the current message
-        # This ensures the reader is always grounded in the corpus
-        context_parts = ["FROM THE RECORD:\n"]
-        for chunk in retrieved_chunks:
-            context_parts.append(f"[{chunk['source_name']}, {chunk['date']}]\n{chunk['content']}\n")
-
-        context_text = "\n".join(context_parts)
-
-        # Add current message with corpus context
-        messages.append({
-            'role': 'user',
-            'content': f"{context_text}\n---\n\n{message}"
-        })
-
-        # Call Claude API
-        response = client.messages.create(
-            model='claude-sonnet-4-5',
-            max_tokens=1024,
-            system=SYSTEM_PROMPT,
-            messages=messages
-        )
-
-        response_text = response.content[0].text
-
-        # Log the session
-        log_entry = {
-            'timestamp': datetime.now().isoformat(),
-            'session_id': session_id,
-            'message': message,
-            'history': history,
-            'retrieved_chunks': retrieved_chunks,
-            'response': response_text
-        }
-
-        log_file = os.path.join(LOGS_DIR, f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{session_id}.json")
-        with open(log_file, 'w') as f:
-            json.dump(log_entry, f, indent=2)
-
-        # Return response
+    # Opening reflection
+    if is_opening:
+        reflection, sources = get_opening_reflection(api_key)
         return jsonify({
-            'response': response_text,
-            'opening_reflection': opening_reflection,
-            'sources': [{'source_name': c['source_name'], 'date': c['date']} for c in retrieved_chunks],
-            'session_id': session_id
+            "opening_reflection": reflection,
+            "sources": sources,
+            "session_id": session_id
         })
 
-    except Exception as e:
-        print(f"Error: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({'error': str(e)}), 500
+    # Regular turn
+    if not conversation_history or len(conversation_history) == 0:
+        return jsonify({"error": "No user message"}), 400
 
-@app.route('/', methods=['GET'])
-def index():
-    """Simple HTML interface for testing the chat endpoint."""
-    html = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>After Japhy - RAG Chat Interface</title>
-        <style>
-            body { font-family: Arial, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; }
-            .container { background: #f5f5f5; padding: 20px; border-radius: 8px; }
-            h1 { color: #333; }
-            .chat-box { height: 400px; border: 1px solid #ccc; overflow-y: auto; padding: 10px; background: white; margin: 10px 0; border-radius: 4px; }
-            .message { margin: 10px 0; padding: 8px; border-radius: 4px; }
-            .user { background: #e3f2fd; text-align: right; }
-            .assistant { background: #f1f8e9; }
-            .sources { font-size: 0.9em; color: #666; margin-top: 5px; }
-            input, textarea, button { width: 100%; padding: 10px; margin: 5px 0; box-sizing: border-box; }
-            button { background: #2196F3; color: white; border: none; cursor: pointer; border-radius: 4px; }
-            button:hover { background: #1976D2; }
-            .error { background: #ffebee; color: #c62828; padding: 10px; border-radius: 4px; margin: 10px 0; }
-            .loading { color: #666; font-style: italic; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>After Japhy - AI Reader Chat</h1>
-            <p>Ask questions about the corpus of personal writing.</p>
+    user_message = conversation_history[-1]['content']
 
-            <div class="chat-box" id="chatBox"></div>
+    # Step 1: Retrieve top chunks
+    top_chunks = retrieve_top_chunks(user_message, top_k=15)
+    context_passages = [get_chunk_text(chunk_id) for chunk_id in top_chunks]
 
-            <textarea id="messageInput" placeholder="Ask a question..." rows="3"></textarea>
-            <button onclick="sendMessage()">Send</button>
+    # Step 2: Entity extraction
+    extracted = extract_entities_and_relationships(context_passages[:10], api_key)
 
-            <div id="error"></div>
-        </div>
+    # Step 3: Mini-graph construction
+    thematic_web = build_mini_graph(extracted)
 
-        <script>
-            let history = [];
-            let sessionId = generateUUID();
-            let hasLoadedOpening = false;
+    # Step 4: Synthesis
+    response_text = synthesize_response(
+        user_message,
+        context_passages,
+        thematic_web,
+        conversation_history,
+        api_key
+    )
 
-            function generateUUID() {
-                return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
-                    var r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
-                    return v.toString(16);
-                });
-            }
+    # Get sources
+    sources = []
+    for chunk_id in top_chunks[:5]:
+        metadata = get_chunk_metadata(chunk_id)
+        if metadata:
+            sources.append(metadata)
 
-            function loadOpeningReflection() {
-                if (hasLoadedOpening) return;
-                hasLoadedOpening = true;
+    # Log turn
+    log_session(session_id, {
+        "timestamp": datetime.utcnow().isoformat(),
+        "user_message": user_message,
+        "response": response_text,
+        "sources": sources,
+        "chunk_count": len(top_chunks)
+    })
 
-                fetch('/chat', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({
-                        message: '...',
-                        history: [],
-                        session_id: sessionId
-                    })
-                })
-                .then(r => r.json())
-                .then(data => {
-                    if (data.opening_reflection) {
-                        addMessage('assistant', data.opening_reflection);
-                    }
-                })
-                .catch(e => console.error('Error loading opening reflection:', e));
-            }
-
-            function sendMessage() {
-                const message = document.getElementById('messageInput').value.trim();
-                if (!message) return;
-
-                // Display user message
-                addMessage('user', message);
-                document.getElementById('messageInput').value = '';
-                addMessage('loading', 'Thinking...');
-
-                // Send to API
-                fetch('/chat', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({
-                        message: message,
-                        history: history,
-                        session_id: sessionId
-                    })
-                })
-                .then(r => r.json())
-                .then(data => {
-                    removeLoading();
-                    if (data.response) {
-                        // Show opening reflection if this is the first turn
-                        if (data.opening_reflection && history.length === 0) {
-                            addMessage('assistant', data.opening_reflection);
-                        }
-
-                        addMessage('assistant', data.response);
-
-                        // Show sources
-                        if (data.sources && data.sources.length > 0) {
-                            let sourcesText = 'Sources: ' + data.sources.map(s => `${s.source_name} (${s.date})`).join(', ');
-                            addMessage('sources', sourcesText);
-                        }
-
-                        // Update history
-                        history.push({role: 'user', content: message});
-                        history.push({role: 'assistant', content: data.response});
-                    } else {
-                        showError('Error: ' + (data.error || 'Unknown error'));
-                    }
-                })
-                .catch(e => {
-                    removeLoading();
-                    showError('Network error: ' + e.message);
-                });
-            }
-
-            function addMessage(role, text) {
-                const box = document.getElementById('chatBox');
-                const div = document.createElement('div');
-                div.className = 'message ' + role;
-                if (role === 'sources') {
-                    div.className = 'message sources';
-                    div.textContent = text;
-                } else if (role === 'loading') {
-                    div.className = 'message loading';
-                    div.textContent = text;
-                } else if (role === 'user') {
-                    div.textContent = 'You: ' + text;
-                } else {
-                    div.textContent = 'Assistant: ' + text;
-                }
-                box.appendChild(div);
-                box.scrollTop = box.scrollHeight;
-            }
-
-            function removeLoading() {
-                const box = document.getElementById('chatBox');
-                const loading = box.querySelector('.loading');
-                if (loading) loading.remove();
-            }
-
-            function showError(msg) {
-                document.getElementById('error').innerHTML = '<div class="error">' + msg + '</div>';
-            }
-
-            // Allow Enter key to send
-            document.getElementById('messageInput').addEventListener('keypress', function(e) {
-                if (e.key === 'Enter' && !e.shiftKey) {
-                    e.preventDefault();
-                    sendMessage();
-                }
-            });
-
-            // Load opening reflection on page load
-            document.addEventListener('DOMContentLoaded', function() {
-                loadOpeningReflection();
-            });
-
-            // Also load immediately in case DOMContentLoaded already fired
-            if (document.readyState === 'loading') {
-                document.addEventListener('DOMContentLoaded', loadOpeningReflection);
-            } else {
-                loadOpeningReflection();
-            }
-        </script>
-    </body>
-    </html>
-    """
-    return html
-
-@app.route('/health', methods=['GET'])
-def health():
-    return jsonify({'status': 'ok', 'message': 'After Japhy RAG server running'})
+    return jsonify({
+        "response": response_text,
+        "sources": sources,
+        "session_id": session_id
+    })
 
 @app.route('/test/retrieve', methods=['POST'])
 def test_retrieve():
-    """Test endpoint that retrieves chunks without calling Claude API"""
-    try:
-        data = request.get_json()
-        message = data.get('message', 'test')
+    """Test retrieval without LLM call."""
+    data = request.json
+    query = data.get('query', '')
 
-        if not vectorizer:
-            return jsonify({'error': 'TF-IDF vectorizer not loaded'}), 500
+    if not query:
+        return jsonify({"error": "No query provided"}), 400
 
-        query_embedding = vectorizer.transform([message]).toarray()[0]
-        search_results = collection.query(
-            query_embeddings=[query_embedding.tolist()],
-            n_results=3,
-            include=['documents', 'metadatas']
-        )
+    top_chunks = retrieve_top_chunks(query, top_k=10)
 
-        chunks = []
-        if search_results and search_results.get('documents'):
-            docs = search_results['documents'][0] if search_results['documents'] else []
-            metas = search_results.get('metadatas', [[]])[0] if search_results.get('metadatas') else [{}] * len(docs)
-
-            for i, doc in enumerate(docs):
-                meta = metas[i] if i < len(metas) else {}
-                chunks.append({
-                    'source': meta.get('source_name', 'unknown'),
-                    'date': meta.get('date', 'unknown'),
-                    'content': doc[:200] + '...' if len(doc) > 200 else doc
-                })
-
-        return jsonify({
-            'message': message,
-            'chunks_retrieved': len(chunks),
-            'chunks': chunks
+    results = []
+    for chunk_id in top_chunks:
+        text = get_chunk_text(chunk_id)
+        metadata = get_chunk_metadata(chunk_id)
+        results.append({
+            "chunk_id": chunk_id,
+            "text": text[:200] + "..." if len(text) > 200 else text,
+            "metadata": metadata
         })
-    except Exception as e:
-        print(f"Test retrieve error: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({'error': str(e)}), 500
+
+    return jsonify({"results": results})
 
 if __name__ == '__main__':
-    api_key_on_startup = os.getenv('ANTHROPIC_API_KEY')
-    if api_key_on_startup:
-        print(f"✓ ANTHROPIC_API_KEY is set on startup", flush=True)
-    else:
-        print(f"✗ ANTHROPIC_API_KEY is NOT set on startup", flush=True)
-    app.run(debug=False, port=8000)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(debug=False, host='0.0.0.0', port=port)
