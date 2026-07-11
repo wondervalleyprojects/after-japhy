@@ -1,0 +1,38 @@
+# Fly.io configuration for After Japhy.
+# The app name must be globally unique on Fly — if "after-japhy" is taken,
+# change it here AND use the same name in `fly apps create`.
+
+app = "after-japhy"
+primary_region = "lax"
+
+[env]
+  LOGS_DIR = "/data/logs"
+
+# Session logs persist here across deploys and restarts.
+# Created once with: fly volumes create japhy_data --region lax --size 1
+[[mounts]]
+  source = "japhy_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # Always-on: one small machine, no cold starts. The 450MB index load
+  # makes wake-from-zero slow enough to break the piece's entrance.
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"
+
+[checks]
+  [checks.health]
+    port = 8080
+    type = "http"
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "60s"
+    method = "get"
+    path = "/health"

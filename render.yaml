@@ -1,9 +1,0 @@
-services:
-  - type: web
-    name: after-japhy
-    env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2
-    envVars:
-      - key: ANTHROPIC_API_KEY
-        sync: false
